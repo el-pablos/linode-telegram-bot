@@ -1,0 +1,14 @@
+[
+  {
+    "name": "account-1",
+    "username": "your-linode-username",
+    "token": "linode-token-1",
+    "enabled": true
+  },
+  {
+    "name": "account-2",
+    "username": "your-linode-username-2",
+    "token": "linode-token-2",
+    "enabled": true
+  }
+]
