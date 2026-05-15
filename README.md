@@ -549,7 +549,7 @@ Coverage flow yang dicek:
 | Metric | Nilai |
 |---|---:|
 | Branch | `master` |
-| Commit lokal | `10` |
+| Commit lokal | `11` |
 | File tracked | `8` |
 | Test terakhir | `12/12 passed` |
 | Bahasa utama | Python |
