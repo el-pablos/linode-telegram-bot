@@ -3,3 +3,8 @@ tokens.json
 .venv/
 __pycache__/
 *.pyc
+logs/
+exports/
+*.log
+*.jsonl
+.pytest_cache/
