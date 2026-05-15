@@ -548,7 +548,7 @@ Coverage flow yang dicek:
 
 | Metric | Nilai |
 |---|---:|
-| Branch | `master` |
+| Branch | `main` |
 | Commit lokal | `>=12` |
 | File tracked | `8` |
 | Test terakhir | `12/12 passed` |
