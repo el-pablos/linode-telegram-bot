@@ -549,8 +549,8 @@ Coverage flow yang dicek:
 | Metric | Nilai |
 |---|---:|
 | Branch | `master` |
-| Commit lokal | `9+` |
-| File tracked | `8+` |
+| Commit lokal | `10` |
+| File tracked | `8` |
 | Test terakhir | `12/12 passed` |
 | Bahasa utama | Python |
 | Framework Telegram | python-telegram-bot |
