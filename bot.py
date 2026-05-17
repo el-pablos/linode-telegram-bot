@@ -710,8 +710,8 @@ def build_plan_from_options(
         args.get("account") or args.get("api"), defaults
     )
     count = int(args.get("count", defaults.get("count", 1)))
-    if count < 1 or count > MAX_COUNT:
-        raise BotError(f"count wajib 1-{MAX_COUNT}")
+    if count < 1:
+        raise BotError("count minimal 1")
     region = args.get("region", defaults.get("region", DEFAULT_REGION))
     region_low = region.lower()
     random_region = parse_bool(
@@ -783,6 +783,15 @@ async def finalize_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if not info:
         raise BotError(f"type tidak ketemu: {plan['type']}")
     plan["type_info"] = info
+    try:
+        max_count = await dynamic_max_count(plan["account"], plan["type"])
+        plan["detected_max"] = max_count
+        if plan["count"] > max_count:
+            plan["count"] = max_count
+    except Exception:
+        plan["detected_max"] = MAX_COUNT
+        if plan["count"] > MAX_COUNT:
+            plan["count"] = MAX_COUNT
     plan["preflight"] = await preflight_create(plan)
     return plan
 
@@ -806,12 +815,12 @@ def plan_summary(plan: dict[str, Any], include_secret: bool = False) -> str:
     lines = [
         "<b>Plan create Linode</b>",
         f"account: <code>{esc(account_choice_text(plan))}</code>",
-        f"region: <code>{esc(region_txt)}</code>",
+        f"region: <code>{esc(region_txt)}</code> (auto-retry jika gagal)",
         f"smart: <code>{esc(plan.get('smart_create'))}</code>",
         f"type: <code>{esc(plan['type'])}</code>",
         f"image: <code>{esc(plan['image'])}</code>",
         f"label: <code>{esc(plan['label_prefix'])}-01..</code>",
-        f"count: <b>{plan['count']}</b>",
+        f"count: <b>{plan['count']}</b> (max detected: {plan.get('detected_max', '?')})",
         f"group: <code>{esc(plan.get('group') or '-')}</code>",
         f"backups: <code>{plan['backups_enabled']}</code>",
         f"private_ip: <code>{plan['private_ip']}</code>",
@@ -845,7 +854,7 @@ async def wizard_text(state: dict[str, Any]) -> str:
             f"🧠 smart: <code>{esc(state.get('smart_create'))}</code>",
             f"📦 type: <code>{esc(state['type'])}</code> ({esc(price_txt)})",
             f"💿 image: <code>{esc(state['image'])}</code>",
-            f"🔢 count: <b>{state['count']}</b>/<b>{MAX_COUNT}</b>",
+            f"🔢 count: <b>{state['count']}</b>",
             f"🏷 label: <code>{esc(state['label_prefix'])}</code>",
             f"👥 group: <code>{esc(state.get('group') or '-')}</code>",
             f"💾 backups: <code>{state['backups_enabled']}</code>",
@@ -1462,6 +1471,97 @@ def classify_linode_error(e: Exception) -> str:
     return "fatal"
 
 
+async def get_retry_regions(original_region: str) -> list[str]:
+    regions = await regions_catalog()
+    ids = [r["id"] for r in regions]
+    id_regions = [r for r in ids if r.startswith("id-")]
+    ap_regions = [r for r in ids if r.startswith("ap-") or r.startswith("id-")]
+    pool = []
+    for r in id_regions:
+        if r != original_region and r not in pool:
+            pool.append(r)
+    for r in ap_regions:
+        if r != original_region and r not in pool:
+            pool.append(r)
+    for r in ids:
+        if r != original_region and r not in pool:
+            pool.append(r)
+    return pool
+
+
+async def create_linode_with_retry(
+    plan: dict[str, Any], index: int, account: str, region: str
+) -> tuple[dict[str, Any], list[str]]:
+    attempts: list[str] = []
+    try:
+        res = await create_linode_once(plan, index, account, region)
+        attempts.append(f"✅ {region}")
+        return res, attempts
+    except Exception as e:
+        kind = classify_linode_error(e)
+        attempts.append(f"❌ {region}: {e}")
+        if kind in {"account", "fatal"}:
+            raise
+    retry_regions = await get_retry_regions(region)
+    for alt_region in retry_regions[:8]:
+        try:
+            res = await create_linode_once(plan, index, account, alt_region)
+            attempts.append(f"✅ {alt_region} (retry)")
+            return res, attempts
+        except Exception as e:
+            kind = classify_linode_error(e)
+            attempts.append(f"❌ {alt_region}: {e}")
+            if kind in {"account", "fatal"}:
+                raise
+            await asyncio.sleep(1)
+    raise BotError(f"Gagal di semua region: {', '.join(attempts)}")
+
+
+async def detect_account_limits(account_name: str) -> dict[str, Any]:
+    limits: dict[str, Any] = {"max_linodes": 100, "balance": 0.0, "used": 0}
+    try:
+        instances = await get_paginated("/linode/instances", account=account_name)
+        limits["used"] = len(instances)
+    except Exception:
+        pass
+    try:
+        acct = await linode_request("GET", "/account", account=account_name)
+        limits["balance"] = float(acct.get("balance") or 0)
+        transfer = acct.get("active_since")
+        if transfer:
+            limits["active_since"] = transfer
+    except Exception:
+        pass
+    try:
+        settings = await linode_request(
+            "GET", "/account/settings", account=account_name
+        )
+        if settings and settings.get("managed"):
+            limits["managed"] = True
+    except Exception:
+        pass
+    limits["remaining"] = max(0, limits["max_linodes"] - limits["used"])
+    return limits
+
+
+async def dynamic_max_count(account_name: str, type_id: str) -> int:
+    limits = await detect_account_limits(account_name)
+    remaining_quota = limits["remaining"]
+    info = await type_info(type_id)
+    monthly_cost = float((info.get("price") or {}).get("monthly") or 0) if info else 0
+    if monthly_cost > 0:
+        affordable = (
+            int(abs(limits["balance"]) / monthly_cost)
+            if limits["balance"] <= 0
+            else 999
+        )
+        if limits["balance"] > 0:
+            affordable = remaining_quota
+    else:
+        affordable = remaining_quota
+    return max(1, min(remaining_quota, affordable, 100))
+
+
 async def create_linode_once(
     plan: dict[str, Any], index: int, account: str, region: str
 ) -> dict[str, Any]:
@@ -1594,6 +1694,7 @@ async def do_create(user_id: int, update: Update | None = None, message=None) ->
     created_raw: list[dict[str, Any]] = []
     created_norm: list[dict[str, Any]] = []
     errors: list[str] = []
+    retry_logs: list[str] = []
     audit_event("linode.create.confirmed", "confirmed", update=update, request=plan)
     if plan.get("smart_create") or plan.get("account_mode") == "smart":
         for i in range(1, plan["count"] + 1):
@@ -1604,17 +1705,20 @@ async def do_create(user_id: int, update: Update | None = None, message=None) ->
                 errors.append(
                     f"smart-{i:02d}: gagal setelah attempts: {' | '.join(attempts[-5:])}"
                 )
+            retry_logs.extend(attempts)
     else:
         accounts = pick_accounts_for_plan(plan)
-        regs = await region_pool(plan)
         for i in range(1, plan["count"] + 1):
             account = accounts[i - 1]["name"]
             region = (
-                random.choice(regs) if plan.get("random_region") else plan["region"]
+                plan["region"]
+                if not plan.get("random_region")
+                else (await region_pool(plan))[0]
             )
             try:
-                res = await create_linode_once(plan, i, account, region)
+                res, attempts = await create_linode_with_retry(plan, i, account, region)
                 created_raw.append(res)
+                retry_logs.extend(attempts)
                 await asyncio.sleep(0.7)
             except Exception as e:
                 errors.append(f"{plan['label_prefix']}-{i:02d}@{region}/{account}: {e}")
@@ -1645,30 +1749,31 @@ async def do_create(user_id: int, update: Update | None = None, message=None) ->
             request=plan,
         )
     LAST_CREATED[user_id] = created_norm
-    lines = ["<b>Create result</b>"]
-    for x in created_norm:
-        lines.append(
-            f"✅ <code>{esc(x.get('label'))}</code> id=<code>{esc(x.get('id'))}</code> "
-            f"account=<code>{esc(x.get('account'))}</code> region=<code>{esc(x.get('region'))}</code> ip=<code>{esc(first_ip(x))}</code>"
-        )
+    lines = []
+    if created_norm:
+        lines.append(f"<b>Sukses membuat {len(created_norm)} linodes:</b>")
+        for x in created_norm:
+            ip = first_ip(x)
+            lines.append(
+                f"<code>{ip}:{x.get('username', 'root')}:{esc(plan['root_pass'])}</code>"
+            )
     save_info = None
     if created_norm and plan.get("save_vps"):
         try:
             save_info = append_to_vps_json(created_norm)
-            lines.append(
-                f"vps.json: added={save_info['added']} skipped={save_info['skipped']} path=<code>{esc(save_info['path'])}</code>"
-            )
+            lines.append(f"\nvps.json: +{save_info['added']} saved")
             audit_event(
                 "vpsjson.append.success", "success", update=update, request=save_info
             )
         except Exception as e:
             lines.append(f"vps.json error: <code>{esc(e)}</code>")
             audit_event("vpsjson.append.failed", "failed", update=update, error=e)
-    if created_norm:
-        lines.append(f"root_pass: <code>{esc(plan['root_pass'])}</code>")
-        lines.append(
-            "Simpan sekarang. Password tidak disimpan kecuali save_vps_json ON."
-        )
+    if retry_logs:
+        retried = [r for r in retry_logs if "retry" in r]
+        if retried:
+            lines.append(
+                f"\n<i>Auto-retry region: {len(retried)}x berhasil pindah region</i>"
+            )
     for err in errors:
         lines.append(f"❌ {esc(err)}")
     kb = InlineKeyboardMarkup(
@@ -2623,7 +2728,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             elif field == "image":
                 state["image"] = value
             elif field == "count":
-                state["count"] = max(1, min(int(value), MAX_COUNT))
+                state["count"] = max(1, int(value))
             await render_wizard(update, context)
         elif data.startswith("wiz:toggle:"):
             field = data.split(":", 2)[2]
