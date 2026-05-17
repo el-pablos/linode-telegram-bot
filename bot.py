@@ -527,29 +527,19 @@ async def account_health(account_name: str, force: bool = False) -> dict[str, An
     }
     try:
         profile = await linode_request("GET", "/profile", account=account_name)
-        acct = await linode_request("GET", "/account", account=account_name)
         health["token_ok"] = True
         health["username"] = profile.get("username")
-        health["balance"] = acct.get("balance")
-        health["uninvoiced"] = acct.get("balance_uninvoiced")
         try:
-            limits = await linode_request(
-                "GET", "/account/limits", account=account_name
-            )
-        except Exception as e:
-            limits = {}
-            health["last_error"] = f"limits unknown: {e}"
+            acct = await linode_request("GET", "/account", account=account_name)
+            health["balance"] = acct.get("balance")
+            health["uninvoiced"] = acct.get("balance_uninvoiced")
+        except Exception:
+            pass
         instances = await get_paginated("/linode/instances", account=account_name)
         used = len(instances)
-        limit = (
-            limits.get("linodes")
-            or limits.get("linode_instances")
-            or limits.get("linode")
-        )
-        remaining = None if limit is None else max(int(limit) - used, 0)
         health["linodes_used"] = used
-        health["linodes_limit"] = int(limit) if limit is not None else None
-        health["linodes_remaining"] = remaining
+        health["linodes_limit"] = None
+        health["linodes_remaining"] = None
         try:
             notif = await get_paginated("/account/notifications", account=account_name)
             health["notifications"] = [
@@ -557,10 +547,9 @@ async def account_health(account_name: str, force: bool = False) -> dict[str, An
             ]
         except Exception:
             pass
-        blocked = bool(remaining is not None and remaining <= 0)
         health["ok"] = True
-        health["can_create"] = not blocked
-        health["status"] = "block" if blocked else ("warn" if limit is None else "ok")
+        health["can_create"] = True
+        health["status"] = "ok"
     except LinodeAPIError as e:
         health["last_error"] = str(e)
         health["status"] = "block" if e.status_code in {401, 403} else "error"
@@ -2160,56 +2149,97 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Error: {e}")
 
 
-async def regions_text(force: bool = False) -> str:
+CATALOG_MSG_PAGE = 20
+
+
+async def regions_text(page: int = 0, force: bool = False) -> tuple[str, int]:
     regions = await regions_catalog(force=force)
-    lines = ["<b>Regions</b>"]
-    for r in regions[:100]:
+    total = len(regions)
+    pages = max(1, (total + CATALOG_MSG_PAGE - 1) // CATALOG_MSG_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = regions[page * CATALOG_MSG_PAGE : (page + 1) * CATALOG_MSG_PAGE]
+    lines = [f"<b>Regions</b> (hal {page + 1}/{pages})"]
+    for r in chunk:
         lines.append(f"<code>{esc(r.get('id'))}</code> - {esc(r.get('label'))}")
-    return "\n".join(lines)
+    return "\n".join(lines), pages
+
+
+def catalog_nav_keyboard(
+    prefix: str, page: int, pages: int
+) -> InlineKeyboardMarkup | None:
+    if pages <= 1:
+        return None
+    buttons = []
+    if page > 0:
+        buttons.append(
+            InlineKeyboardButton("◀ Prev", callback_data=f"{prefix}:{page - 1}")
+        )
+    if page < pages - 1:
+        buttons.append(
+            InlineKeyboardButton("Next ▶", callback_data=f"{prefix}:{page + 1}")
+        )
+    return InlineKeyboardMarkup([buttons])
 
 
 async def regions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     try:
-        await update.message.reply_html(await regions_text())
+        text, pages = await regions_text(0)
+        await update.message.reply_html(
+            text, reply_markup=catalog_nav_keyboard("cat:reg", 0, pages)
+        )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 
-async def types_text(force: bool = False) -> str:
+async def types_text(page: int = 0, force: bool = False) -> tuple[str, int]:
     types = await types_catalog(force=force)
-    lines = ["<b>Types</b>"]
-    for t in types[:100]:
+    total = len(types)
+    pages = max(1, (total + CATALOG_MSG_PAGE - 1) // CATALOG_MSG_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = types[page * CATALOG_MSG_PAGE : (page + 1) * CATALOG_MSG_PAGE]
+    lines = [f"<b>Types</b> (hal {page + 1}/{pages})"]
+    for t in chunk:
         price = t.get("price") or {}
         lines.append(
-            f"<code>{esc(t.get('id'))}</code> - {esc(t.get('label'))} ${esc(price.get('monthly', '-'))}/mo ${esc(price.get('hourly', '-'))}/hr"
+            f"<code>{esc(t.get('id'))}</code> - {esc(t.get('label'))} ${esc(price.get('monthly', '-'))}/mo"
         )
-    return "\n".join(lines)
+    return "\n".join(lines), pages
 
 
 async def types_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     try:
-        await update.message.reply_html(await types_text())
+        text, pages = await types_text(0)
+        await update.message.reply_html(
+            text, reply_markup=catalog_nav_keyboard("cat:typ", 0, pages)
+        )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 
-async def images_text(force: bool = False) -> str:
+async def images_text(page: int = 0, force: bool = False) -> tuple[str, int]:
     images = await images_catalog(force=force)
-    lines = ["<b>Images</b>"]
-    for img in images[:100]:
+    total = len(images)
+    pages = max(1, (total + CATALOG_MSG_PAGE - 1) // CATALOG_MSG_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = images[page * CATALOG_MSG_PAGE : (page + 1) * CATALOG_MSG_PAGE]
+    lines = [f"<b>Images</b> (hal {page + 1}/{pages})"]
+    for img in chunk:
         lines.append(f"<code>{esc(img.get('id'))}</code> - {esc(img.get('label'))}")
-    return "\n".join(lines)
+    return "\n".join(lines), pages
 
 
 async def images_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     try:
-        await update.message.reply_html(await images_text())
+        text, pages = await images_text(0)
+        await update.message.reply_html(
+            text, reply_markup=catalog_nav_keyboard("cat:img", 0, pages)
+        )
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -2479,11 +2509,34 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 include_secret=False,
             )
         elif data == "cmd:regions":
-            await q.message.reply_html(await regions_text())
+            text, pages = await regions_text(0)
+            await q.message.reply_html(
+                text, reply_markup=catalog_nav_keyboard("cat:reg", 0, pages)
+            )
         elif data == "cmd:types":
-            await q.message.reply_html(await types_text())
+            text, pages = await types_text(0)
+            await q.message.reply_html(
+                text, reply_markup=catalog_nav_keyboard("cat:typ", 0, pages)
+            )
         elif data == "cmd:images":
-            await q.message.reply_html(await images_text())
+            text, pages = await images_text(0)
+            await q.message.reply_html(
+                text, reply_markup=catalog_nav_keyboard("cat:img", 0, pages)
+            )
+        elif data.startswith("cat:"):
+            parts = data.split(":")
+            cat_type = parts[1]
+            page = int(parts[2]) if len(parts) > 2 else 0
+            if cat_type == "reg":
+                text, pages = await regions_text(page)
+                kb = catalog_nav_keyboard("cat:reg", page, pages)
+            elif cat_type == "typ":
+                text, pages = await types_text(page)
+                kb = catalog_nav_keyboard("cat:typ", page, pages)
+            else:
+                text, pages = await images_text(page)
+                kb = catalog_nav_keyboard("cat:img", page, pages)
+            await q.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         elif data == "cmd:refresh":
             reload_accounts()
             CATALOG_CACHE.clear()
